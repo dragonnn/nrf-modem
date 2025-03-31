@@ -2,15 +2,17 @@
 #![doc = include_str!("../README.md")]
 // #![warn(missing_docs)]
 
-use crate::error::ErrorSource;
 use core::{
     cell::RefCell,
     ops::Range,
     sync::atomic::{AtomicBool, Ordering},
 };
+
 use critical_section::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use linked_list_allocator::Heap;
+
+use crate::error::ErrorSource;
 
 mod at;
 mod at_notifications;
@@ -28,9 +30,6 @@ mod tcp_stream;
 mod udp_socket;
 pub(crate) mod waker_node_list;
 
-pub use no_std_net;
-pub use nrfxlib_sys;
-
 pub use at::*;
 pub use at_notifications::AtNotificationStream;
 pub use cancellation::CancellationToken;
@@ -39,15 +38,15 @@ pub use dtls_socket::*;
 pub use error::Error;
 pub use gnss::*;
 pub use lte_link::LteLink;
+pub use no_std_net;
+#[cfg(feature = "nrf9120")]
+use nrf9120_pac as pac;
+#[cfg(feature = "nrf9160")]
+use nrf9160_pac as pac;
+pub use nrfxlib_sys;
 pub use sms::*;
 pub use tcp_stream::*;
 pub use udp_socket::*;
-
-#[cfg(feature = "nrf9160")]
-use nrf9160_pac as pac;
-
-#[cfg(feature = "nrf9120")]
-use nrf9120_pac as pac;
 
 /// We need to wrap our heap so it's creatable at run-time and accessible from an ISR.
 ///
@@ -81,10 +80,7 @@ pub async fn init(mode: SystemMode) -> Result<(), Error> {
 }
 
 /// Start the NRF Modem library with a manually specified memory layout
-pub async fn init_with_custom_layout(
-    mode: SystemMode,
-    memory_layout: MemoryLayout,
-) -> Result<(), Error> {
+pub async fn init_with_custom_layout(mode: SystemMode, memory_layout: MemoryLayout) -> Result<(), Error> {
     if INITIALIZED.fetch_or(true, Ordering::SeqCst) {
         return Err(Error::ModemAlreadyInitialized);
     }
@@ -109,9 +105,7 @@ pub async fn init_with_custom_layout(
 
     // The modem is only certified when the DC/DC converter is enabled and it isn't by default
     unsafe {
-        (*pac::REGULATORS_NS::PTR)
-            .dcdcen
-            .modify(|_, w| w.dcdcen().enabled());
+        (*pac::REGULATORS_S::PTR).dcdcen.modify(|_, w| w.dcdcen().enabled());
     }
 
     unsafe {
@@ -162,10 +156,8 @@ pub async fn init_with_custom_layout(
     unsafe {
         // Use the same TX memory region as above
         critical_section::with(|cs| {
-            *TX_ALLOCATOR.borrow(cs).borrow_mut() = Some(Heap::new(
-                params.shmem.tx.base as usize as *mut u8,
-                params.shmem.tx.size as usize,
-            ))
+            *TX_ALLOCATOR.borrow(cs).borrow_mut() =
+                Some(Heap::new(params.shmem.tx.base as usize as *mut u8, params.shmem.tx.size as usize))
         });
     }
 
@@ -176,12 +168,11 @@ pub async fn init_with_custom_layout(
     at_notifications::initialize()?;
 
     // Turn off the modem
-    let (modem_state,) =
-        at_commands::parser::CommandParser::parse(at::send_at::<32>("AT+CFUN?").await?.as_bytes())
-            .expect_identifier(b"+CFUN: ")
-            .expect_int_parameter()
-            .expect_identifier(b"\r\nOK\r\n")
-            .finish()?;
+    let (modem_state,) = at_commands::parser::CommandParser::parse(at::send_at::<32>("AT+CFUN?").await?.as_bytes())
+        .expect_identifier(b"+CFUN: ")
+        .expect_int_parameter()
+        .expect_identifier(b"\r\nOK\r\n")
+        .finish()?;
 
     if modem_state != 0 {
         // The modem is still turned on (probably from a previous run). Let's turn it off
@@ -232,11 +223,7 @@ impl Default for MemoryLayout {
 
 unsafe extern "C" fn modem_fault_handler(_info: *mut nrfxlib_sys::nrf_modem_fault_info) {
     #[cfg(feature = "defmt")]
-    defmt::error!(
-        "Modem fault - reason: {}, pc: {}",
-        (*_info).reason,
-        (*_info).program_counter
-    );
+    defmt::error!("Modem fault - reason: {}, pc: {}", (*_info).reason, (*_info).program_counter);
 }
 
 unsafe extern "C" fn modem_dfu_handler(_val: u32) {
@@ -293,12 +280,8 @@ impl SystemMode {
             ConnectionPreference::None => true,
             ConnectionPreference::Lte => self.lte_support,
             ConnectionPreference::Nbiot => self.nbiot_support,
-            ConnectionPreference::NetworkPreferenceWithLteFallback => {
-                self.lte_support && self.nbiot_support
-            }
-            ConnectionPreference::NetworkPreferenceWithNbiotFallback => {
-                self.lte_support && self.nbiot_support
-            }
+            ConnectionPreference::NetworkPreferenceWithLteFallback => self.lte_support && self.nbiot_support,
+            ConnectionPreference::NetworkPreferenceWithNbiotFallback => self.lte_support && self.nbiot_support,
         }
     }
 
@@ -351,10 +334,7 @@ struct RuntimeState {
 
 impl RuntimeState {
     const fn new() -> Self {
-        Self {
-            state: embassy_sync::mutex::Mutex::new((false, 0)),
-            error: AtomicBool::new(false),
-        }
+        Self { state: embassy_sync::mutex::Mutex::new((false, 0)), error: AtomicBool::new(false) }
     }
 
     pub(crate) async fn activate_gps(&self) -> Result<(), Error> {
@@ -390,10 +370,7 @@ impl RuntimeState {
     }
 
     pub(crate) fn deactivate_gps_blocking(&self) -> Result<(), Error> {
-        let mut state = self
-            .state
-            .try_lock()
-            .map_err(|_| Error::InternalRuntimeMutexLocked)?;
+        let mut state = self.state.try_lock().map_err(|_| Error::InternalRuntimeMutexLocked)?;
 
         if !state.0 {
             panic!("Can't deactivate an inactive gps");
@@ -451,10 +428,7 @@ impl RuntimeState {
     }
 
     pub(crate) fn deactivate_lte_blocking(&self) -> Result<(), Error> {
-        let mut state = self
-            .state
-            .try_lock()
-            .map_err(|_| Error::InternalRuntimeMutexLocked)?;
+        let mut state = self.state.try_lock().map_err(|_| Error::InternalRuntimeMutexLocked)?;
 
         if state.1 == 0 {
             panic!("Can't deactivate an inactive lte");
@@ -487,11 +461,7 @@ impl RuntimeState {
     pub(crate) async unsafe fn reset_runtime_state(&self) -> Result<(), Error> {
         let mut state = self.state.lock().await;
 
-        if self
-            .error
-            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
+        if self.error.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             ModemDeactivation::Everything.act_on_modem().await?;
             state.0 = false;
             state.1 = 0;
